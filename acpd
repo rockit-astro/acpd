@@ -1,0 +1,128 @@
+#!/usr/bin/env python3.4
+#
+# This file is part of acpd.
+#
+# acpd is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# acpd is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with acpd.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Front end for the ACP web server"""
+
+import datetime
+import re
+import urllib.parse
+import urllib.request
+import Pyro4
+import astropy.time
+from warwick.observatory.common import daemons, log
+
+# TODO: Remove these
+from warwick.observatory.common import IP
+daemons.nites_acp_server = daemons.PyroDaemon('nites_acp_daemon', IP.NitesMain, 9011, 5)
+
+# Set automatically when generating RPM package
+SOFTWARE_VERSION = 'UNKNOWN'
+
+ACP_URI = 'http://127.0.0.1/ac/asystemstatus.asp'
+QUERY_TIMEOUT = 3
+
+DATA_REGEX = "_s\('(?P<key>[^']*)','@.[nf](?P<value>[^']*)'\)"
+CAM_TEMP_REGEX = "(?P<temperature>-?[\d\.]+)%B0C/(?P<power>[\d\.]+)%25"
+
+# pylint: disable=broad-except
+# pylint: disable=too-few-public-methods
+# pylint: disable=no-self-use
+
+
+class ACPStatusDaemon:
+    """Wraps a web request to the ACP web server"""
+    def __init__(self):
+        self._query_error = False
+        self._regex = re.compile(DATA_REGEX)
+        self._cam_temp_regex = re.compile(CAM_TEMP_REGEX)
+
+    @Pyro4.expose
+    def last_measurement(self):
+        """Query the latest valid measurement.
+        May return None if no data is available"""
+        try:
+            with urllib.request.urlopen(ACP_URI, timeout=QUERY_TIMEOUT) as response:
+                result = response.readlines()[-1].decode('ascii').split(';')
+
+            data = {
+                # Set fallback date in case the query below fails
+                'date': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'software_version': SOFTWARE_VERSION
+            }
+
+            for line in result:
+                match = self._regex.match(line)
+                if match:
+                    key = match.group('key')
+                    value = match.group('value')
+
+                    if key == 'sm_utc':
+                        # Update date with ACP value
+                        data['date'] = datetime.datetime.utcnow().strftime('%Y-%m-%dT') \
+                            + value.replace('%3A', ':') + 'Z'
+                    elif key == 'sm_lst':
+                        data['obs_lst'] = value.replace('%3A', ':')
+                    elif key == 'sm_obsStat':
+                        data['obs_status'] = urllib.parse.unquote(value)
+                    elif key == 'sm_plnTgt':
+                        data['obs_script'] = 'None' if value == 'n/a%20%28-/-%29' else urllib.parse.unquote(value)
+                    elif key == 'sm_actStat':
+                        data['obs_activity'] = urllib.parse.unquote(value)
+                    elif key == 'sm_plnCnt':
+                        data['obs_progress'] = value
+                    elif key == 'sm_lastFWHM':
+                        data['obs_fwhm'] = value
+                    elif key == 'sm_scopeStat':
+                        data['tel_status'] = urllib.parse.unquote(value)
+                    elif key == 'sm_ra':
+                        data['tel_ra'] = value.replace('%3A', ':')
+                    elif key == 'sm_dec':
+                        data['tel_dec'] = value.replace('%B0', ':').replace('%27', ':').replace('%22', '')
+                    elif key == 'sm_alt':
+                        data['tel_alt'] = value.replace('%B0', '')
+                    elif key == 'sm_az':
+                        data['tel_az'] = value.replace('%B0', '')
+                    elif key == 'sm_camStat':
+                        data['cam_status'] = urllib.parse.unquote(value)
+                    elif key == 'sm_imgFilt':
+                        data['cam_filter'] = urllib.parse.unquote(value)
+                    elif key == 'sm_imgBin':
+                        data['cam_binning'] = value.replace('%3A', 'x')
+                    elif key == 'sm_imgTemp':
+                        temp_match = self._cam_temp_regex.match(value)
+                        if temp_match:
+                            data['cam_temperature'] = temp_match.group('temperature')
+                            data['cam_cooler'] = temp_match.group('power')
+
+            if self._query_error:
+                log.info('acpd', 'Restored contact with ACP web server')
+                self._query_error = False
+
+            return data
+
+        except Exception as exception:
+            print('{} ERROR: failed to query from ACP web server: {}' \
+                  .format(datetime.datetime.utcnow(), str(exception)))
+
+            if not self._query_error:
+                log.error('acpd', 'Lost contact with ACP web server')
+                self._query_error = True
+
+            return None
+
+if __name__ == '__main__':
+    daemons.nites_acp_server.launch(ACPStatusDaemon())
