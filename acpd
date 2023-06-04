@@ -18,11 +18,13 @@
 """Front end for the ACP web server"""
 
 import datetime
+import time
 import re
+import threading
 import urllib.parse
 import urllib.request
 import Pyro4
-import astropy.time
+from astropy.time import Time
 from warwick.observatory.common import daemons, log
 
 # Set automatically when generating RPM package
@@ -34,9 +36,11 @@ QUERY_TIMEOUT = 3
 DATA_REGEX = "_s\('(?P<key>[^']*)','@.[nf](?P<value>[^']*)'\)"
 CAM_TEMP_REGEX = "(?P<temperature>-?[\d\.]+)%B0C/(?P<power>[\d\.]+)%25"
 
+# pylint: disable=consider-using-f-string
 # pylint: disable=broad-except
 # pylint: disable=too-few-public-methods
 # pylint: disable=no-self-use
+# pylint: disable=invalid-name
 
 
 class ACPStatusDaemon:
@@ -45,6 +49,198 @@ class ACPStatusDaemon:
         self._query_error = False
         self._regex = re.compile(DATA_REGEX)
         self._cam_temp_regex = re.compile(CAM_TEMP_REGEX)
+        # create a weather loop thread for pinging
+        # data to ACP single line file
+        self.weather_loop = threading.Thread(target=self.__weather_loop)
+        self.weather_loop.daemon = True
+        self.weather_loop.start()
+
+    def __write_acp_single_line(self, line, filetype='singleline'):
+        """
+        Write out the single line file for ACP
+        """
+        if filetype == 'singleline':
+            name = "C:\\weather\\boltwood3.txt"
+            opentype = 'w'
+        else:
+            name = "C:\\weather\\boltwood3_history.txt"
+            opentype = 'a'
+        try:
+            f = open(name, opentype)
+            f.write(line)
+            f.close()
+        except IOError:
+            log.warn('Cannot access the boltwood weather file!')
+
+    def __log_messages(self, buff, message_type):
+        """
+        Write out the error buffer to a file
+
+        Todo: Replace this with logging to the database
+        """
+        if message_type == "error":
+            name = "C:\\weather\\errors3.txt"
+        elif message_type == 'info':
+            name = "C:\\weather\\info3.txt"
+        else:
+            name = "C:\\weather\\warnings3.txt"
+        with open(name, 'a') as f:
+            for b in buff:
+                line = "{} {}\n".format(datetime.datetime.utcnow(), b)
+                f.write(line)
+
+    def __weather_loop(self):
+        """
+        Run an infinite loop checking the weather
+        """
+        # weather tokens for ACP
+        tokens = {'W': 0, 'R': 0, 'r': 0, 'w': 0}
+        # these sensor values never change
+        NOWDAYS_OFFSET = 2415018.5
+        T_unit = 'C'
+        V_unit = 'K'
+        SenT = '22.0'
+        Hea = '2'
+        c = '1'
+        d = '1'
+        # initialise the data to None
+        wrk_data = None
+        # initialise the data values to 0
+        wind = 0
+        temperature = 0
+        humidity = 0
+        dew_point = 0
+        sky_temp = 0
+        # how many failed reads are ok?
+        FAILED_MEASUREMENT_LIMIT = 10
+
+        # loop forever
+        while 1:
+            # WARNING and ERROR logs
+            WARWICK_ENVIRONMENT_FAILED_READS = 0
+            WARNING_LOG = []
+            ERROR_LOG = []
+            # get the current time
+            date = datetime.datetime.utcnow()
+
+            # ping windmillhill environment and write single line file for ACP
+            # format of the boltwood single line file for ACP
+            # this is taken from the original boltwood_imitate script
+            #    Date Time 'C' 'K' SkyT AmbT 'SenT' Wind Hum DewPt 'Hea' *R* *W* since NowDays c *w* *r* d
+            # values in '' never change
+            # flags in ** are used to trigger safe/unsafe
+            try:
+                with daemons.warwick_environment.connect() as wrk_env:
+                    wrk_data = wrk_env.status()
+                    # parse all the data
+                    if wrk_data:
+                        # vaisala
+                        vaisala = wrk_data['vaisala']['parameters']
+                        cloudwatcher = wrk_data['cloudwatcher']['parameters']
+                        rain_sensors = wrk_data['rain']['parameters']
+                        n_parameters = len(vaisala) + len(cloudwatcher) + len(rain_sensors)
+
+                        # first check if all measurements are ok and current
+                        current, unsafe = 0, 0
+                        for param in vaisala:
+                            unsafe += vaisala[param]['unsafe']
+                            current += vaisala[param]['current']
+                        for param in cloudwatcher:
+                            unsafe += cloudwatcher[param]['unsafe']
+                            current += cloudwatcher[param]['current']
+                        for param in rain_sensors:
+                            unsafe += rain_sensors[param]['unsafe']
+                            current += rain_sensors[param]['current']
+
+                        # if any are unsafe or stale, trigger alert by setting tokens
+                        if unsafe > 0 or current < n_parameters:
+                            tokens['W'] = 2
+                            tokens['R'] = 2
+                            tokens['r'] = 3
+                            tokens['w'] = 3
+                        else:
+                            tokens['W'] = 0
+                            tokens['R'] = 0
+                            tokens['r'] = 1
+                            tokens['w'] = 1
+
+                        # next fetch the actual values for writing to single line file
+                        wind = int(vaisala['wind_gust']['latest'])
+                        temperature = round(vaisala['temperature']['latest'], 1)
+                        #wind_direction = vaisala['wind_direction']['latest'] # missing atm
+                        humidity = int(vaisala['relative_humidity']['latest'])
+                        dew_point_delta = round(vaisala['dew_point_delta']['latest'], 2)
+                        dew_point = round(temperature - dew_point_delta, 1)
+                        sky_temp = round(cloudwatcher['sky_temp']['latest'], 2)
+
+                        WARWICK_ENVIRONMENT_FAILED_READS = 0
+                    # or report problem
+                    else:
+                        WARWICK_ENVIRONMENT_FAILED_READS += 1
+                        WARNING_LOG.append('WARNING: CANNOT READ WINDMILL HILL VAISALA IN {0:d} ATTEMPTS'.format(WARWICK_ENVIRONMENT_FAILED_READS))
+            except Pyro4.errors.CommunicationError:
+                WARWICK_ENVIRONMENT_FAILED_READS += 1
+                WARNING_LOG.append('WARNING: UNABLE TO COMMUNICATE WITH WARWICK ENVIRONMENT IN {0:d} ATTEMPTS'.format(WARWICK_ENVIRONMENT_FAILED_READS))
+
+            # keep track of not being able to read from environment, close after some time
+            if WARWICK_ENVIRONMENT_FAILED_READS > FAILED_MEASUREMENT_LIMIT:
+                ERROR_LOG.append('ERROR: FAILED TO READ WARWICK ENVIRONMENT IN >{0:d} ATTEMPTS, ALERTING ACP'.format(FAILED_MEASUREMENT_LIMIT))
+                # set all weather to bad
+                tokens['W'] = 2
+                tokens['R'] = 2
+                tokens['r'] = 3
+                tokens['w'] = 3
+
+            # print any warnings
+            print('{0:d} Warnings:'.format(len(WARNING_LOG)))
+            for W in WARNING_LOG:
+                print(W)
+            self.__log_messages(WARNING_LOG, "warning")
+
+            # print any errors
+            print('{0:d} Errors:'.format(len(ERROR_LOG)))
+            for E in ERROR_LOG:
+                print(E)
+            self.__log_messages(ERROR_LOG, "error")
+
+            # generate the single line for ACP
+            jd_local = Time(date, format='datetime').jd
+            now_days = round(jd_local - NOWDAYS_OFFSET, 7)
+            since = int((datetime.datetime.utcnow() - date).seconds)
+
+            # generate the ACP single line file
+            acp_line = ""
+            # annoyingly ACP wants local time for the first entry.
+            # use UTC for the since measurment only
+            current_date = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            acp_line += current_date + ' '
+            acp_line += T_unit + ' ' # dummy
+            acp_line += V_unit + ' ' # dummy
+            acp_line += str(sky_temp) + ' '
+            acp_line += str(temperature) + ' '
+            acp_line += SenT + ' '
+            acp_line += str(wind) + ' '
+            acp_line += str(humidity) + ' '
+            acp_line += str(dew_point) + ' '
+            acp_line += Hea + ' ' # dummy
+            acp_line += str(tokens['R']) + ' '
+            acp_line += str(tokens['W']) + ' '
+            acp_line += str(since) + ' '
+            acp_line += str(now_days, 7) + ' '
+            acp_line += c + ' '
+            acp_line += str(tokens['w']) + ' '
+            acp_line += str(tokens['r']) + ' '
+            acp_line += d + '\n'
+            print(acp_line.rstrip())
+
+            # write the line to disc
+            history_line = "{}: {} ".format(datetime.datetime.utcnow(), acp_line)
+            self.__write_acp_single_line(acp_line, filetype='singleline')
+            self.__write_acp_single_line(history_line, filetype='history')
+
+            # sleep for 10 seconds
+            time.sleep(10)
+
 
     @Pyro4.expose
     def last_measurement(self):
