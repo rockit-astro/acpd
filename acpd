@@ -226,7 +226,7 @@ class ACPStatusDaemon:
             acp_line += str(tokens['R']) + ' '
             acp_line += str(tokens['W']) + ' '
             acp_line += str(since) + ' '
-            acp_line += str(now_days, 7) + ' '
+            acp_line += str(now_days) + ' '
             acp_line += c + ' '
             acp_line += str(tokens['w']) + ' '
             acp_line += str(tokens['r']) + ' '
