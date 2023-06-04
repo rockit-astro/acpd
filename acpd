@@ -70,7 +70,7 @@ class ACPStatusDaemon:
             f.write(line)
             f.close()
         except IOError:
-            log.warn('Cannot access the boltwood weather file!')
+            log.warning('Cannot access the boltwood weather file!')
 
     def __log_messages(self, buff, message_type):
         """
