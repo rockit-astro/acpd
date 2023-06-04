@@ -25,10 +25,6 @@ import Pyro4
 import astropy.time
 from warwick.observatory.common import daemons, log
 
-# TODO: Remove these
-from warwick.observatory.common import IP
-daemons.nites_acp_server = daemons.PyroDaemon('nites_acp_daemon', IP.NitesMain, 9011, 5)
-
 # Set automatically when generating RPM package
 SOFTWARE_VERSION = 'UNKNOWN'
 
@@ -125,4 +121,4 @@ class ACPStatusDaemon:
             return None
 
 if __name__ == '__main__':
-    daemons.nites_acp_server.launch(ACPStatusDaemon())
+    daemons.warwick_acp_monitor.launch(ACPStatusDaemon())
